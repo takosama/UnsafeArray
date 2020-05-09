@@ -3,6 +3,8 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Runtime;
+using System.Runtime.InteropServices;
+using UnsafeArray;
 
 namespace ConsoleApp22
 {
@@ -13,23 +15,21 @@ namespace ConsoleApp22
             BenchmarkDotNet.Running.BenchmarkRunner.Run<Bentimark>();
 
 
-            UnsafeArray<int> arr = new UnsafeArray<int>(100);
+            UnsafeArray<int> p0 = new UnsafeArray<int>(100);
+            int[] arr = new int[100];
+            UnsafeArray<int> p1 = new UnsafeArray<int>(arr);
+            int* p = p1.Pointer;
 
-            arr[0] = 0;
-            arr[100] = 100;
-
-            int* p = arr.Pointer;
-            *(p + 10) = 10;
-
-
+            p0.Free();
+           
             //解放時は下のうちどちらかで開放できます
             //つまりarrがなくてもポインタさえあれば解放できる
-            //    arr.Free();
+            //    p1.Free();
             // PointerManager.Free(p);
 
 
             //メイン関数にこれを置いておけば未開放分をすべて解放されます
-            //今回の場合はarrが解放される
+          
             PointerManager.FreeAll();
         }
     }
@@ -37,61 +37,61 @@ namespace ConsoleApp22
 
     public class Bentimark
     {
-        int size = 1000000;
+        int size = 200_000_000;
         [BenchmarkDotNet.Attributes.Benchmark]
         public void BentimarkNomal()
         {
             int[] arr = new int[size];
-            for (int i = 0; i < size; i += 10)
-            {
+            for (int i = 0; i < size; i++)
                 arr[i] = i;
-                arr[i + 1] = i;
-                arr[i + 2] = i;
-                arr[i + 3] = i;
-                arr[i + 4] = i;
-                arr[i + 5] = i;
-                arr[i + 6] = i;
-                arr[i + 7] = i;
-                arr[i + 8] = i;
-                arr[i + 9] = i;
-            }
+        }
+
+        [BenchmarkDotNet.Attributes.Benchmark]
+        public void BentimarkNomalToUnsafe()
+        {
+            int[] arr = new int[size];
+            var p = new UnsafeArray<int>(arr);
+
+            for (int i = 0; i < size; i++)
+                p[i] = i;
+            p.Free();
         }
 
         [BenchmarkDotNet.Attributes.Benchmark]
         public void BentimarkMyArray()
         {
             UnsafeArray<int> arr = new UnsafeArray<int>(size);
-            for (int i = 0; i < size; i += 10)
-            {
-                arr[i] = i;
-                arr[i + 1] = i;
-                arr[i + 2] = i;
-                arr[i + 3] = i;
-                arr[i + 4] = i;
-                arr[i + 5] = i;
-                arr[i + 6] = i;
-                arr[i + 7] = i;
-                arr[i + 8] = i;
-                arr[i + 9] = i;
 
-            }
+            for (int i = 0; i < size; i++)
+                arr[i] = i;
             arr.Free();
         }
 
 
     }
+}
 
-    unsafe class UnsafeArray<T> where T : unmanaged
+namespace UnsafeArray
+{
+    public unsafe class UnsafeArray<T> where T : unmanaged
     {
-        public T* Pointer { get; }
+        public T* Pointer { get; private set; }
+        public T[] Array { get; private set; }
         int size = 0;
         public UnsafeArray(int size)
         {
-            var ptr = PointerManager.Alloc<T>(size);
-            this.Pointer = ptr;
-            this.size = size;
+            this.Array = new T[size];
+            this.Pointer = PointerManager.AddArray(this.Array);
+            this.size = this.Array.Length;
         }
 
+        public UnsafeArray(T[] array)
+        {
+            this.Array = array;
+            this.Pointer = PointerManager.AddArray(array);
+            this.size = array.Length;
+        }
+    
         public T this[int index]
         {
             get
@@ -108,18 +108,29 @@ namespace ConsoleApp22
         {
             PointerManager.Free(this.Pointer);
         }
+
+
     }
 
     unsafe static class PointerManager
     {
-        static List<(IntPtr ptr, int size)> ps = new List<(IntPtr, int)>();
+        static List<(IntPtr ptr, int size, GCHandle? hdl)> ps = new List<(IntPtr, int, GCHandle?)>();
 
         static public T* Alloc<T>(int num) where T : unmanaged
         {
             int size = num * sizeof(T);
-            var ptr = System.Runtime.InteropServices.Marshal.AllocHGlobal(size);
-            ps.Add((ptr, size));
+            var ptr = System.Runtime.InteropServices.Marshal.AllocCoTaskMem(size);
+            ps.Add((ptr, size, null));
             return (T*)ptr.ToPointer();
+        }
+
+        static public T* AddArray<T>(T[] array) where T : unmanaged
+        {
+            var hdl = System.Runtime.InteropServices.GCHandle.Alloc(array, GCHandleType.Pinned);
+            int size = array.Length * sizeof(T);
+            var ptr = hdl.AddrOfPinnedObject();
+            ps.Add((ptr, size, hdl));
+            return (T*)ptr;
         }
 
         static public int GetSize<T>(T* ptr) where T : unmanaged
@@ -135,10 +146,20 @@ namespace ConsoleApp22
         static public void Free<T>(T* ptr) where T : unmanaged
         {
             IntPtr intPtr = (IntPtr)ptr;
-            if (ps.Remove(ps.Find(x => x.ptr == intPtr)))
-                System.Runtime.InteropServices.Marshal.FreeHGlobal(intPtr);
+
+            var item = ps.Find(x => x.ptr == intPtr);
+            if (!item.hdl.HasValue)
+                if (ps.Remove(item))
+                    System.Runtime.InteropServices.Marshal.FreeCoTaskMem(intPtr);
+                else
+                    throw new Exception("0x" + string.Format("{0:x}", intPtr.ToInt64()).PadLeft(16, '0') + " is not memory manage target in this library");
             else
-                throw new Exception("0x" + string.Format("{0:x}", intPtr.ToInt64()).PadLeft(16, '0') + " is not memory manage target in this library");
+            {
+                if (ps.Remove(item))
+                    item.hdl.Value.Free();
+                else
+                    throw new Exception("0x" + string.Format("{0:x}", intPtr.ToInt64()).PadLeft(16, '0') + " is not memory manage target in this library");
+            }
         }
 
         static public void FreeAll()
